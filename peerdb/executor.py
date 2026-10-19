@@ -79,6 +79,13 @@ class Grouped:
             last = last.scatter_reduce(0, gid, idx, reduce="amax", include_self=True)
         self.last_row = last
 
+    def derive(self) -> "Grouped":
+        """Copy for a downstream operator, so every register keeps its own state."""
+        g = Grouped.__new__(Grouped)
+        g.__dict__.update(self.__dict__)
+        g.minmax_calls = list(self.minmax_calls)
+        return g
+
 
 def _sort_rank(v: Vec, strings) -> torch.Tensor:
     """Dense rank consistent with SQLite ordering (NULL < numbers < text)."""
@@ -199,6 +206,7 @@ class Executor:
     def op_filter(self, src: Name, cond):
         r = self._reg(src)
         if isinstance(r, Grouped):
+            r = r.derive()
             mask = as_bool(self._eval_group(cond, r)).is_true().expand(r.ngroups)
             r.order = r.order[mask[r.order]]
             return r
@@ -234,6 +242,7 @@ class Executor:
             exprs.append(k.args[0])
             desc.append(k.fn == "desc")
         if isinstance(r, Grouped):
+            r = r.derive()
             self._note_minmax(r, exprs)
             if r.keys and len(r.keys) == len(exprs):
                 # SQLite emits groups in GROUP BY order, with each GROUP BY term
@@ -252,6 +261,7 @@ class Executor:
         r = self._reg(src)
         n, off = int(count.value), int(offset.value) if offset is not None else 0
         if isinstance(r, Grouped):
+            r = r.derive()
             r.order = r.order[off: off + n] if n >= 0 else r.order[off:]
             return r
         stop = r.n if n < 0 else min(r.n, off + n)
@@ -268,6 +278,7 @@ class Executor:
                 names.append(("", e.name.lower() if isinstance(e, Col) else f"#{i}"))
                 items.append(e)
         if isinstance(r, Grouped):
+            r = r.derive()
             self._note_minmax(r, items)
             vecs, affs = [], []
             for e in items:
