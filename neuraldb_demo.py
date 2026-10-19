@@ -27,10 +27,10 @@ size and on the number of conditions; labels are checked against SQLite
 Usage
   python neuraldb_demo.py test
   # 1 GPU
-  python neuraldb_demo.py train --out runs/nd --d 512 --r-layers 6 --grad-ckpt
+  python neuraldb_demo.py train --out runs/nd --d 256 --r-layers 6 --grad-ckpt
   # 4 x RTX 4090
-  torchrun --nproc_per_node 4 neuraldb_demo.py train --out runs/nd --d 512 --r-layers 6 \
-      --grad-ckpt --n-max 1000 --steps 200000
+  torchrun --nproc_per_node 4 neuraldb_demo.py train --out runs/nd --d 256 --r-layers 6 \
+      --grad-ckpt --n-max 1000 --steps 100000 --eval-every 5000
   # accuracy by table size
   python neuraldb_demo.py eval --ckpt runs/nd/last.pt --sizes 10,100,1000,10000,100000
 
