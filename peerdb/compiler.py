@@ -56,7 +56,12 @@ class Compiler:
         # Set when an aggregate query selects a column that is neither grouped
         # nor aggregated; SQL leaves the chosen row unspecified.
         self.bare_columns = False
-        out = self._query(tree)
+        try:
+            out = self._query(tree)
+        except KeyError as e:
+            # e.g. a subquery naming an outer column (correlated) or a
+            # recursive CTE name: report it instead of guessing
+            raise Unsupported(f"unresolved name: {e.args[0]}") from None
         self.steps.append(Step(None, Call("return", (Name(f"r{out}"),))))
         return self.steps
 
