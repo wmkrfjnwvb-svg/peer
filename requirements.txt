@@ -1,0 +1,6 @@
+torch>=2.3
+transformers>=4.45
+accelerate>=0.34
+sqlglot>=25
+ijson>=3.2
+pytest>=8
