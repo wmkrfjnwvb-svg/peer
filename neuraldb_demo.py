@@ -10,9 +10,19 @@ computed values (COUNT / SUM / AVG).
 
 Loss is built for exactness (every row must be right): boundary-row
 weighting, a logit margin, hard-row mining, margin cross entropy on digits,
-and a global COUNT / SUM consistency term. Training data are fresh random
-tables each batch with a growing table size; labels are checked against
-SQLite (``test``).
+a global COUNT / SUM consistency term, and intermediate supervision of the
+steps behind each select decision:
+  dcmp  each literal digit vs the row's digit at the same place
+  cmp   the row's whole value vs each literal (lt / eq / gt, or eq / ne)
+  cond  each condition's truth for the row
+  sel   the final decision (conditions combined with AND / OR)
+These are learned bottom-up: expect dcmp to fall first, then cmp, cond and
+finally sel. Each condition is laid out inside every row next to the cells
+(input layout only), so comparisons happen within a row.
+
+Training data are fresh random tables each batch, with curricula on table
+size and on the number of conditions; labels are checked against SQLite
+(``test``).
 
 Usage
   python neuraldb_demo.py test
@@ -72,6 +82,10 @@ D0 = TOK["d0"]
 W0 = TOK["w000"]
 
 TYPES = ["page", "count", "sum", "avg", "min", "max"]
+MAX_CONDS = 3
+ROLES = ["other", "cond_col", "op", "lit_lo", "lit_hi", "conj", "target_col", "page_no"]
+CMP = ["lt", "eq", "gt", "ne"]  # numbers: lt / eq / gt; categories: eq / ne
+ROW_ROLES = ["cls", "cell", "target", "op", "lit_lo", "lit_hi"]
 INT_OPS = ["=", "!=", "<", "<=", ">", ">=", "BETWEEN"]
 CAT_OPS = ["=", "!="]
 
@@ -100,11 +114,16 @@ class Example:
     query: Query
     q_tokens: list[int]
     q_places: list[int]  # digit place of each query token (DIGITS for non-digits)
+    q_segs: list[int]  # which condition (1..MAX_CONDS) each query token belongs to, 0 otherwise
+    q_roles: list[int]  # role of each query token (see ROLES)
     sel: np.ndarray  # (N,) bool: rows satisfying WHERE
     order: np.ndarray  # row ids in output order (selected rows only)
     target_vals: np.ndarray | None  # (N,) values of the target column
     boundary: np.ndarray  # (N,) float: row sits on a condition boundary
     answer: object
+    cond_true: np.ndarray  # (N, MAX_CONDS) int8: condition i holds for the row; -1 = no condition i
+    cmp_lo: np.ndarray  # (N, MAX_CONDS) int8: row value vs condition literal (CMP classes); -1 = none
+    cmp_hi: np.ndarray  # (N, MAX_CONDS) int8: row value vs the upper BETWEEN literal; -1 = none
     extras: dict = field(default_factory=dict)
 
 
@@ -137,11 +156,12 @@ def _literal(rng, t: Table, j: int) -> int:
     return int(rng.integers(0, t.hi[j]))
 
 
-def gen_query(rng: np.random.Generator, t: Table, qtype: str | None = None) -> Query:
+def gen_query(rng: np.random.Generator, t: Table, qtype: str | None = None, max_conds: int = MAX_CONDS) -> Query:
     qtype = qtype or str(rng.choice(TYPES, p=[0.3, 0.15, 0.15, 0.1, 0.15, 0.15]))
     k = len(t.names)
     ints = [j for j in range(k) if t.is_int[j]]
-    ncond = int(rng.choice([0, 1, 2, 3], p=[0.15, 0.4, 0.3, 0.15]))
+    probs = np.array([0.15, 0.4, 0.3, 0.15][: max_conds + 1])
+    ncond = int(rng.choice(np.arange(len(probs)), p=probs / probs.sum()))
     conds = []
     for _ in range(ncond):
         j = int(rng.integers(k))
@@ -187,29 +207,58 @@ def query_places(toks: list[int]) -> list[int]:
     return places
 
 
-def query_tokens(t: Table, q: Query) -> list[int]:
-    toks = [CLS]
+def query_tokens(t: Table, q: Query) -> tuple[list[int], list[int], list[int]]:
+    """Query tokens plus, per token, its condition index and role.
+
+    The segment / role marks only describe where each token sits in the query
+    (a tokenizer can produce them); they make it easy for every row to find
+    the conditions that concern its columns.
+    """
+    toks, segs, roles = [], [], []
+
+    def add(ts, seg=0, role="other"):
+        toks.extend(ts)
+        segs.extend([seg] * len(ts))
+        roles.extend([ROLES.index(role)] * len(ts))
+
+    add([CLS])
     if q.qtype == "page":
-        toks += [TOK["SELECT"], TOK["*"]]
+        add([TOK["SELECT"], TOK["*"]])
     elif q.qtype == "count":
-        toks += [TOK["COUNT"], TOK["("], TOK["*"], TOK[")"]]
+        add([TOK["COUNT"], TOK["("], TOK["*"], TOK[")"]])
     else:
-        toks += [TOK[q.qtype.upper()], TOK["("], TOK[t.names[q.target]], TOK[")"]]
+        add([TOK[q.qtype.upper()], TOK["("]])
+        add([TOK[t.names[q.target]]], role="target_col")
+        add([TOK[")"]])
     if q.conds:
-        toks.append(TOK["WHERE"])
+        add([TOK["WHERE"]])
         for i, (j, op, lit) in enumerate(q.conds):
+            seg = i + 1
             if i:
-                toks.append(TOK[q.conj])
-            toks += [TOK[t.names[j]], TOK[op]]
+                add([TOK[q.conj]], role="conj")
+            add([TOK[t.names[j]]], seg, "cond_col")
+            add([TOK[op]], seg, "op")
             if op == "BETWEEN":
-                toks += _cell_text(t, j, lit[0]) + [TOK["AND"]] + _cell_text(t, j, lit[1])
+                add(_cell_text(t, j, lit[0]), seg, "lit_lo")
+                add([TOK["AND"]], seg, "op")
+                add(_cell_text(t, j, lit[1]), seg, "lit_hi")
             else:
-                toks += _cell_text(t, j, lit)
+                add(_cell_text(t, j, lit), seg, "lit_lo")
     if q.qtype == "page":
         if q.target is not None:
-            toks += [TOK["ORDER"], TOK["BY"], TOK[t.names[q.target]], TOK["DESC" if q.desc else "ASC"]]
-        toks += [TOK["PAGE"]] + _num_tokens(q.page)
-    return toks
+            add([TOK["ORDER"], TOK["BY"]])
+            add([TOK[t.names[q.target]]], role="target_col")
+            add([TOK["DESC" if q.desc else "ASC"]])
+        add([TOK["PAGE"]])
+        add(_num_tokens(q.page), role="page_no")
+    return toks, segs, roles
+
+
+def _cmp_classes(t: Table, j: int, lit: int) -> np.ndarray:
+    col = t.values[:, j]
+    if t.is_int[j]:
+        return (np.sign(col - lit) + 1).astype(np.int8)  # lt=0, eq=1, gt=2
+    return np.where(col == lit, CMP.index("eq"), CMP.index("ne")).astype(np.int8)
 
 
 def _cond_mask(t: Table, c) -> tuple[np.ndarray, np.ndarray]:
@@ -230,10 +279,20 @@ def label(t: Table, q: Query) -> Example:
     n = t.values.shape[0]
     sel = np.ones(n, dtype=bool) if not q.conds or q.conj == "AND" else np.zeros(n, dtype=bool)
     boundary = np.zeros(n, dtype=np.float32)
-    for c in q.conds:
+    cond_true = np.full((n, MAX_CONDS), -1, dtype=np.int8)
+    cmp_lo = np.full((n, MAX_CONDS), -1, dtype=np.int8)
+    cmp_hi = np.full((n, MAX_CONDS), -1, dtype=np.int8)
+    for i, c in enumerate(q.conds):
         m, near = _cond_mask(t, c)
         sel = (sel & m) if q.conj == "AND" else (sel | m)
         boundary = np.maximum(boundary, near.astype(np.float32))
+        cond_true[:, i] = m
+        j, op, lit = c
+        if op == "BETWEEN":
+            cmp_lo[:, i] = _cmp_classes(t, j, lit[0])
+            cmp_hi[:, i] = _cmp_classes(t, j, lit[1])
+        else:
+            cmp_lo[:, i] = _cmp_classes(t, j, lit)
     rows = np.arange(n)
     tv = t.values[:, q.target] if q.target is not None else None
     if tv is not None:
@@ -253,13 +312,14 @@ def label(t: Table, q: Query) -> Example:
         answer = (int(tv[sel].sum()) * 100) // int(sel.sum()) if sel.any() else None
     else:
         answer = int(order[0]) if len(order) else None
-    toks = query_tokens(t, q)
-    return Example(t, q, toks, query_places(toks), sel, order, tv, boundary, answer)
+    toks, segs, roles = query_tokens(t, q)
+    return Example(t, q, toks, query_places(toks), segs, roles, sel, order, tv, boundary, answer,
+                   cond_true, cmp_lo, cmp_hi)
 
 
-def gen_example(rng: np.random.Generator, n: int, qtype: str | None = None) -> Example:
+def gen_example(rng: np.random.Generator, n: int, qtype: str | None = None, max_conds: int = MAX_CONDS) -> Example:
     t = gen_table(rng, n)
-    return label(t, gen_query(rng, t, qtype))
+    return label(t, gen_query(rng, t, qtype, max_conds))
 
 
 def to_sql(t: Table, q: Query) -> str:
@@ -311,13 +371,22 @@ def collate(examples: list[Example]) -> dict[str, torch.Tensor]:
     n = max(e.table.values.shape[0] for e in examples)
     k = max(len(e.table.names) for e in examples)
     q = max(len(e.q_tokens) for e in examples)
-    t_len = 1 + k * DIGITS
+    slot = 1 + 2 * DIGITS  # per condition: op token, low literal, high literal
+    t_len = 1 + k * DIGITS + MAX_CONDS * slot
 
     tok = np.full((b, n, t_len), PAD, dtype=np.int64)
     col = np.full((b, n, t_len), PAD, dtype=np.int64)
     place = np.full((b, n, t_len), DIGITS, dtype=np.int64)
+    rseg = np.zeros((b, n, t_len), dtype=np.int64)  # bitmask of conditions a token belongs to
+    rrole = np.zeros((b, n, t_len), dtype=np.int64)  # ROW_ROLES
+    dcmp = np.full((b, n, t_len), IGNORE, dtype=np.int64)  # per literal digit: row digit vs literal digit
     q_tok = np.full((b, q), PAD, dtype=np.int64)
     q_place = np.full((b, q), DIGITS, dtype=np.int64)
+    q_seg = np.zeros((b, q), dtype=np.int64)
+    q_role = np.zeros((b, q), dtype=np.int64)
+    cond = np.full((b, n, MAX_CONDS), -1.0, dtype=np.float32)
+    cmp_lo = np.full((b, n, MAX_CONDS), IGNORE, dtype=np.int64)
+    cmp_hi = np.full((b, n, MAX_CONDS), IGNORE, dtype=np.int64)
     row_mask = np.zeros((b, n), dtype=bool)
     sel = np.zeros((b, n), dtype=np.float32)
     boundary = np.zeros((b, n), dtype=np.float32)
@@ -337,13 +406,46 @@ def collate(examples: list[Example]) -> dict[str, torch.Tensor]:
             s = 1 + j * DIGITS
             col[i, :rows, s: s + DIGITS] = TOK[name]
             place[i, :rows, s: s + DIGITS] = np.arange(DIGITS)
+            rrole[i, :rows, s: s + DIGITS] = ROW_ROLES.index("target" if j == e.query.target else "cell")
             if t.is_int[j]:
                 tok[i, :rows, s: s + DIGITS] = TOK["d0"] + digits_of(t.values[:, j])
             else:
                 tok[i, :rows, s] = W0 + t.values[:, j]
                 place[i, :rows, s] = 0
+        # Each condition is written into every row next to the cells, so a row
+        # can compare its own value with the literal digit by digit. This is
+        # input layout only: which column a condition names comes from the
+        # query text; all comparison and logic is left to the model.
+        for c, (j, op, lit) in enumerate(e.query.conds):
+            bit = 1 << c
+            cs = 1 + j * DIGITS
+            rseg[i, :rows, cs: cs + DIGITS] |= bit
+            base = 1 + k * DIGITS + c * slot
+            tok[i, :rows, base] = TOK[op]
+            col[i, :rows, base: base + slot] = TOK[t.names[j]]
+            rseg[i, :rows, base: base + slot] = bit
+            rrole[i, :rows, base] = ROW_ROLES.index("op")
+            lits = lit if op == "BETWEEN" else (lit, None)
+            for h, v in enumerate(lits):
+                if v is None:
+                    continue
+                ls = base + 1 + h * DIGITS
+                rrole[i, :rows, ls: ls + DIGITS] = ROW_ROLES.index("lit_hi" if h else "lit_lo")
+                if t.is_int[j]:
+                    lit_digits = digits_of(np.array([v]))[0]
+                    tok[i, :rows, ls: ls + DIGITS] = TOK["d0"] + lit_digits
+                    place[i, :rows, ls: ls + DIGITS] = np.arange(DIGITS)
+                    dcmp[i, :rows, ls: ls + DIGITS] = np.sign(digits_of(t.values[:, j]) - lit_digits[None]) + 1
+                else:
+                    tok[i, :rows, ls] = W0 + v
+                    place[i, :rows, ls] = 0
         q_tok[i, : len(e.q_tokens)] = e.q_tokens
         q_place[i, : len(e.q_places)] = e.q_places
+        q_seg[i, : len(e.q_segs)] = e.q_segs
+        q_role[i, : len(e.q_roles)] = e.q_roles
+        cond[i, :rows] = e.cond_true
+        cmp_lo[i, :rows] = np.where(e.cmp_lo < 0, IGNORE, e.cmp_lo)
+        cmp_hi[i, :rows] = np.where(e.cmp_hi < 0, IGNORE, e.cmp_hi)
         row_mask[i, :rows] = True
         sel[i, :rows] = e.sel
         boundary[i, :rows] = e.boundary
@@ -361,7 +463,8 @@ def collate(examples: list[Example]) -> dict[str, torch.Tensor]:
 
     t = lambda a: torch.from_numpy(a)  # noqa: E731
     return {
-        "tok": t(tok), "col": t(col), "place": t(place), "q_tok": t(q_tok), "q_place": t(q_place),
+        "tok": t(tok), "col": t(col), "place": t(place), "rseg": t(rseg), "rrole": t(rrole), "dcmp": t(dcmp), "q_tok": t(q_tok), "q_place": t(q_place), "q_seg": t(q_seg), "q_role": t(q_role),
+        "cond": t(cond), "cmp_lo": t(cmp_lo), "cmp_hi": t(cmp_hi),
         "row_mask": t(row_mask), "sel": t(sel), "boundary": t(boundary), "read": t(read),
         "qtype": t(qtype), "order": t(order), "page": t(page), "count": t(count), "total": t(total), "scale": t(scale),
     }
@@ -450,6 +553,10 @@ class NeuralDB(nn.Module):
         self.emb = nn.Embedding(len(VOCAB), d, padding_idx=PAD)
         self.place = nn.Embedding(DIGITS + 1, d)
         self.qpos = nn.Embedding(cfg.max_q, d)
+        self.qseg = nn.Embedding(MAX_CONDS + 1, d)
+        self.qrole = nn.Embedding(len(ROLES), d)
+        self.rseg = nn.Embedding(2 ** MAX_CONDS, d)
+        self.rrole = nn.Embedding(len(ROW_ROLES), d)
         self.q_layers = nn.ModuleList(QueryLayer(d, cfg.heads) for _ in range(cfg.q_layers))
         self.q_norm = nn.LayerNorm(d)
         self.r_layers = nn.ModuleList(RowLayer(d, cfg.heads) for _ in range(cfg.r_layers))
@@ -459,36 +566,45 @@ class NeuralDB(nn.Module):
         self.type_head = nn.Linear(d, len(TYPES))
         self.order_head = nn.Linear(d, 3)  # 0 = row order, 1 = ascending, 2 = descending
         self.page_head = nn.Linear(d, MAX_PAGES)
+        # auxiliary per-row heads: each condition's truth and the comparisons behind it
+        self.cond_head = nn.Linear(d, MAX_CONDS)
+        self.cmp_head = nn.Linear(d, MAX_CONDS * 2 * len(CMP))
+        self.dcmp_head = nn.Linear(d, 3)  # on literal digit tokens: row digit <, =, > literal digit
         self.grad_ckpt = False
 
-    def encode_query(self, q_tok, q_place):
+    def encode_query(self, q_tok, q_place, q_seg, q_role):
         pad = q_tok == PAD
         pos = torch.arange(q_tok.shape[1], device=q_tok.device)
-        x = self.emb(q_tok) + self.qpos(pos)[None] + self.place(q_place)
+        x = self.emb(q_tok) + self.qpos(pos)[None] + self.place(q_place) + self.qseg(q_seg) + self.qrole(q_role)
         for layer in self.q_layers:
             x = layer(x, pad)
         return self.q_norm(x), pad
 
-    def read_rows(self, tok, col, place, q, q_pad):
+    ROW_KEYS = ("tok", "col", "place", "rseg", "rrole")
+
+    def read_rows(self, r: dict, q, q_pad):
+        tok = r["tok"]
         cell_pad = tok == PAD
         cell_pad[..., 0] = False  # the row token is always attendable
-        x = self.emb(tok) + self.emb(col) + self.place(place)
+        x = self.emb(tok) + self.emb(r["col"]) + self.place(r["place"]) + self.rseg(r["rseg"]) + self.rrole(r["rrole"])
         for layer in self.r_layers:
             if self.grad_ckpt and self.training:
                 x = checkpoint(layer, x, cell_pad, q, q_pad, use_reentrant=False)
             else:
                 x = layer(x, cell_pad, q, q_pad)
-        return self.r_norm(x[:, :, 0])  # (B, N, d) row states
+        x = self.r_norm(x)
+        return x[:, :, 0], x  # row states (B, N, d) and token states (B, N, T, d)
 
     def forward(self, batch, row_chunk: int | None = None):
-        q, q_pad = self.encode_query(batch["q_tok"], batch["q_place"])
-        tok, col, place = batch["tok"], batch["col"], batch["place"]
-        if row_chunk is None or tok.shape[1] <= row_chunk:
-            rows = self.read_rows(tok, col, place, q, q_pad)
+        q, q_pad = self.encode_query(batch["q_tok"], batch["q_place"], batch["q_seg"], batch["q_role"])
+        n_rows = batch["tok"].shape[1]
+        tokens = None
+        if row_chunk is None or n_rows <= row_chunk:
+            rows, tokens = self.read_rows({k: batch[k] for k in self.ROW_KEYS}, q, q_pad)
         else:  # large tables at inference: rows are independent, so read in chunks
             rows = torch.cat([
-                self.read_rows(tok[:, s: s + row_chunk], col[:, s: s + row_chunk], place[:, s: s + row_chunk], q, q_pad)
-                for s in range(0, tok.shape[1], row_chunk)
+                self.read_rows({k: batch[k][:, s: s + row_chunk] for k in self.ROW_KEYS}, q, q_pad)[0]
+                for s in range(0, n_rows, row_chunk)
             ], dim=1)
         b, n, _ = rows.shape
         return {
@@ -497,6 +613,9 @@ class NeuralDB(nn.Module):
             "type": self.type_head(q[:, 0]),                              # (B, types)
             "order": self.order_head(q[:, 0]),                            # (B, 3)
             "page": self.page_head(q[:, 0]),                              # (B, MAX_PAGES)
+            "cond": self.cond_head(rows),                                 # (B, N, MAX_CONDS)
+            "cmp": self.cmp_head(rows).view(b, n, MAX_CONDS, 2, len(CMP)),  # (B, N, C, lo/hi, CMP)
+            "dcmp": self.dcmp_head(tokens) if tokens is not None and self.training else None,  # (B, N, T, 3)
         }
 
 
@@ -517,6 +636,7 @@ class LossConfig:
     read_margin: float = 1.0
     selected_read_w: float = 3.0
     agg_w: float = 0.1
+    aux_w: float = 1.0
 
 
 def _hard_mean(losses: torch.Tensor, frac: float) -> torch.Tensor:
@@ -583,10 +703,29 @@ def compute_loss(out: dict, batch: dict, cfg: LossConfig = LossConfig()):
     l_order = F.cross_entropy(out["order"].float(), batch["order"], ignore_index=IGNORE) if (batch["order"] != IGNORE).any() else l_type * 0
     l_page = F.cross_entropy(out["page"].float(), batch["page"], ignore_index=IGNORE) if (batch["page"] != IGNORE).any() else l_type * 0
 
+    # --- intermediate supervision: each condition and each comparison -------
+    # The final select decision composes several steps (find my condition,
+    # compare digits, combine with AND/OR). Supervising the steps gives the
+    # model a gradient long before it can get the composition right.
+    cy = batch["cond"]
+    cvalid = (cy >= 0) & rm.bool().unsqueeze(-1)
+    cw = (1 + cfg.boundary_w * batch["boundary"]).unsqueeze(-1) * cvalid
+    l_cond = (F.binary_cross_entropy_with_logits(out["cond"].float(), cy.clamp(min=0), reduction="none") * cw).sum() \
+        / cw.sum().clamp(min=1)
+    cmp_t = torch.stack([batch["cmp_lo"], batch["cmp_hi"]], dim=-1)  # (B, N, C, 2)
+    if (cmp_t != IGNORE).any():
+        l_cmp = F.cross_entropy(out["cmp"].float().flatten(0, 3), cmp_t.flatten(), ignore_index=IGNORE)
+    else:
+        l_cmp = l_cond * 0
+    l_dcmp = l_cond * 0
+    if out.get("dcmp") is not None and (batch["dcmp"] != IGNORE).any():
+        l_dcmp = F.cross_entropy(out["dcmp"].float().flatten(0, 2), batch["dcmp"].flatten(), ignore_index=IGNORE)
+    l_aux = l_cond + l_cmp + l_dcmp
+
     total = (l_sel + cfg.hard_w * l_sel_hard + l_read + cfg.hard_w * l_read_hard
-             + cfg.agg_w * l_agg + l_type + l_order + l_page)
+             + cfg.agg_w * l_agg + cfg.aux_w * l_aux + l_type + l_order + l_page)
     parts = {"sel": l_sel, "sel_hard": l_sel_hard, "read": l_read, "read_hard": l_read_hard,
-             "agg": l_agg, "type": l_type, "order": l_order, "page": l_page}
+             "agg": l_agg, "cond": l_cond, "cmp": l_cmp, "dcmp": l_dcmp, "type": l_type, "order": l_order, "page": l_page}
     return total, {k: float(v.detach()) for k, v in parts.items()}
 
 
@@ -653,8 +792,8 @@ def _same(a, b) -> bool:
 
 
 @torch.no_grad()
-def evaluate(model, sizes, n_queries: int, batch_size: int, device, seed: int = 1234, row_chunk: int = 2048,
-             amp: bool = False) -> dict:
+def evaluate(model, sizes, n_queries: int, batch_size: int, device, seed: int = 1234, row_chunk: int = 1024,
+             amp: bool = False, max_rows: int = 8000) -> dict:
     model.eval()
     report = {}
     for n in sizes:
@@ -662,7 +801,7 @@ def evaluate(model, sizes, n_queries: int, batch_size: int, device, seed: int = 
         per_type = defaultdict(lambda: [0, 0])
         confs = []
         sel_err = sel_rows = read_err = read_rows = 0
-        bs = max(1, min(batch_size, (batch_size * 1000) // max(n, 1)))
+        bs = max(1, min(batch_size, max_rows // max(n, 1)))  # bound rows held at once
         done = 0
         while done < n_queries:
             k = min(bs, n_queries - done)
@@ -736,7 +875,12 @@ def eval_main(argv):
 # ============================================================================
 
 class RandomTables(IterableDataset):
-    """Endless batches of fresh tables; table size follows the curriculum."""
+    """Endless batches of fresh tables.
+
+    Two curricula: the table size grows (log scale) over ``warm_steps``, and
+    queries start with a single condition, allowing two after 10% of training
+    and three after 20%.
+    """
 
     def __init__(self, batch: int, n_min: int, n_max: int, warm_steps: int, total_steps: int, seed: int,
                  max_rows_per_batch: int):
@@ -748,6 +892,10 @@ class RandomTables(IterableDataset):
         frac = min(1.0, step / max(1, self.warm))
         return int(round(math.exp(math.log(self.n_min) + frac * (math.log(self.n_max) - math.log(self.n_min)))))
 
+    def max_conds(self, step: int) -> int:
+        frac = step / max(1, self.total)
+        return 1 if frac < 0.1 else 2 if frac < 0.2 else MAX_CONDS
+
     def __iter__(self):
         info = get_worker_info()
         wid, nw = (info.id, info.num_workers) if info else (0, 1)
@@ -758,7 +906,8 @@ class RandomTables(IterableDataset):
             n = int(round(math.exp(rng.uniform(math.log(self.n_min), math.log(hi)))))
             # about max_rows rows per batch: many small tables early, few large ones later
             b = max(1, min(self.batch, self.max_rows // n))
-            yield collate([gen_example(rng, n) for _ in range(b)])
+            mc = self.max_conds(step)
+            yield collate([gen_example(rng, n, max_conds=mc) for _ in range(b)])
             step += nw
 
 
@@ -834,10 +983,11 @@ def train_main(argv):
             running[k] = 0.98 * running.get(k, v) + 0.02 * v
         if rank == 0 and step % 50 == 0:
             n = batch["tok"].shape[1]
-            msg = " ".join(f"{k}={v:.4f}" for k, v in running.items())
+            msg = " ".join(f"{k}={v:.4f}" for k, v in running.items() if not k.endswith("_hard"))
             print(f"step {step} rows={n} lr={sched.get_last_lr()[0]:.2e} {msg} ({time.time() - t0:.0f}s)", flush=True)
         if rank == 0 and step and (step % args.eval_every == 0 or step == args.steps - 1):
-            report = evaluate(model, eval_sizes, args.eval_queries, args.batch, device, amp=amp)
+            report = evaluate(model, eval_sizes, args.eval_queries, args.batch, device, amp=amp,
+                              max_rows=args.max_rows_per_batch)
             print_report(report, flush=True)
             torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, os.path.join(args.out, "last.pt"))
             with open(os.path.join(args.out, "eval.jsonl"), "a") as f:
